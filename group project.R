@@ -163,3 +163,11 @@ ggplot(protein_missing,
     x = "% missing",
     y = "Aantal eiwitten"
   )
+ggplot(protein_missing,
+       aes(x = Pct_missing)) +
+  geom_histogram(bins = 15) +
+  labs(
+    title = "Verdeling missingness eiwitten",
+    x = "% missing",
+    y = "Aantal eiwitten"
+  )
