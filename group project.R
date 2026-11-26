@@ -172,3 +172,4 @@ ggplot(protein_missing,
     y = "Aantal eiwitten"
   )
 #TEST 1234
+#TEST5678
