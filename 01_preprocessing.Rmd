@@ -1,0 +1,179 @@
+---
+title: "Data preprocessing – Olink-age"
+author: "Group 17"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+This document describes every preprocessing step applied to the Olink-age data,
+why it was done, and what each line of code does. The output (`olink_clean.rds`)
+is the starting point for parts 2–4.
+
+# 1. Load packages and data
+The analysis uses the tidyverse for data handling and plotting. Three files are
+loaded: the sample metadata (one row per sample), the raw NPX values (one row per
+sample, one column per protein) and the protein annotation (one row per protein).
+
+```{r load}
+library(tidyverse)                                   # data handling and plotting
+meta <- read_csv("data/sample_metadata.csv")         # sample metadata
+npx  <- read_csv("data/proteins_npx_raw.csv")        # NPX values per sample and protein
+ann  <- read_csv("data/protein_annotation.csv")      # protein annotation (LOD, synonyms)
+
+dim(meta)                                            # number of rows and columns per table:867 x 76
+dim(npx)                                             # number of rows and columns per table:867 x 1482
+dim(ann)                                             # number of rows and columns per table:1481 x 12
+```
+# 2. Check sample order and set data types
+We first verify that the samples in the metadata and NPX table are in the same order, since all later steps assume that row i in both tables refers to the same sample. Categorical variables are then converted to factors so that R treats them as groups in models and figures; "Young Adult" is set as the reference level.
+```{r}
+all(meta$sample_kit_id == npx$sample_kit_id)   # TRUE = same sample order in both tables
+meta <- meta %>%
+  mutate(subject.ageGroup = factor(subject.ageGroup, levels = c("Young Adult", "Older Adult")))
+levels(meta$subject.ageGroup)
+meta <- meta %>%
+  mutate(across(c(subject.biologicalSex, cmv_status, olink_batch_id, olink_plate_id, sample.visitName), as.factor))   # categorical variables -> factor
+levels(meta$olink_batch_id)
+```
+# 3. Clean metadata
+Two samples had a BMI of 0, which is physiologically impossible; these values were set to missing (NA). Other metadata variables were not modified, but some are unsuitable for later analyses because their missingness is caused by the study design: eGFR was not reported from 2021 onwards (serum creatinine, 10 missing values, can be used instead), total protein was not measured from 2022 onwards, and CMV serology was only measured at specific visits (cmv_status, without missing values, is used instead)
+```{r}
+sum(meta$am.bmi == 0, na.rm = TRUE)                # number of samples with BMI = 0 (impossible value)
+meta <- meta %>% mutate(am.bmi = na_if(am.bmi, 0)) # BMI = 0 -> NA (missing)
+sum(meta$am.bmi == 0, na.rm = TRUE)                # check: should now be 0
+```
+# 4. Merge synonymous assays
+Nine assays were present under two names (an old and a new gene symbol, e.g. CD97 and ADGRE5), because the naming convention changed between Olink batches. No sample had a value in both columns, so each pair was merged into a single column under the new name and the old column was removed. This reduced the number of proteins from 1481 to 1472, matching the number reported for this assay.
+```{r}
+na_per_eiwit <- colMeans(is.na(npx[, -1])) * 100   # % missing values per protein (column 1 = sample_kit_id, skipped)
+
+paren <- ann %>%
+  filter(!is.na(same_assay_as)) %>%                # only proteins that have a synonym
+  select(oud = protein, nieuw = same_assay_as) %>% # two columns: old name and new name
+  filter(na_per_eiwit[oud] > 50)                   # keep each pair once: the old name is the one mostly missing
+
+paren
+
+for (i in 1:nrow(paren)) {                                                     # loop over the 9 pairs
+  npx[[paren$nieuw[i]]] <- coalesce(npx[[paren$nieuw[i]]], npx[[paren$oud[i]]]) # fill gaps in the new column with values from the old column
+}
+npx <- npx %>% select(-all_of(paren$oud))   # remove the 9 old (now redundant) columns
+ncol(npx) - 1                               # number of proteins (minus sample_kit_id): expected 1472
+sum(is.na(npx$ADGRE5))                      # check one merged protein: expected 0 missing
+```
+# 5. LOD filter
+Assays with ≥ 50% of samples below the limit of detection (LOD) were excluded, as the majority of their values cannot be distinguished from background noise. This criterion is independent of the group labels. Of the 1472 assays, 150 were removed, leaving 1322 proteins for further analysis.
+```{r}
+keep <- ann %>%
+  filter(protein %in% names(npx)) %>%   # only proteins still present in npx (after merging)
+  filter(pct_below_lod < 50) %>%        # keep proteins with < 50% of samples below LOD
+  pull(protein)                         # extract the protein names as a vector
+
+length(keep)                            # number of proteins kept: expected 1322
+npx <- npx %>% select(sample_kit_id, all_of(keep))   # keep only sample ID + proteins passing the LOD filter
+ncol(npx) - 1                                        # check: expected 1322
+```
+# 6. Sample quality control
+Sample quality was assessed using the number of missing NPX values and the percentage of proteins below the LOD per sample (0–6 missing values and 3.7–17.8% below LOD, respectively); no samples were excluded. The median NPX per sample was then compared between Olink batches. Samples from batch Q-04064 showed a systematically lower median NPX, and smaller shifts were present between the other batches. Because this shift affects entire batches rather than individual samples, it reflects a technical batch effect, which is addressed in the next step.
+```{r}
+summary(meta$n_missing_npx)   # number of missing NPX values per sample
+summary(meta$pct_below_lod)   # % of proteins below LOD per sample
+qc_df <- data.frame(mediaan = apply(npx[, -1], 1, median, na.rm = TRUE),  # median NPX over all proteins, per sample
+                    batch   = meta$olink_batch_id)                       # batch of each sample
+
+ggplot(qc_df, aes(x = batch, y = mediaan)) +
+  geom_boxplot() +                                                       # distribution of sample medians per batch
+  theme_classic() +
+  labs(x = "Olink batch", y = "Median NPX per sample")
+```
+# 7. Batch effect
+NPX values are already on a log2 scale and approximately symmetrically distributed, so no further log-transformation was applied. Normalisation within each run had been performed by Olink, but the data were not bridged between batches. To assess the impact of this, a principal component analysis (PCA) was performed on the 1303 proteins without missing values, after centring and scaling each protein. Samples clustered primarily by Olink batch (PC1 25.7%, PC2 9.0%), whereas age group gave only a weaker separation within batches. Because age groups were unevenly distributed across batches (e.g. 76% young adults in batch 20201752 versus 64% older adults in batch 20211036), batch and age are partly confounded. Therefore, batch is included as a covariate in all statistical models (parts 2–3), and the NPX data themselves are not corrected. For visualisation only, a batch-corrected matrix was computed with limma::removeBatchEffect, preserving the effects of age group, sex and CMV status. After correction, batch clustering disappeared and age group separated along PC2. Standardisation (z-scores) is applied only within analyses that require it (PCA, heatmaps, machine learning).
+```{r}
+pca_eiwitten <- names(npx)[-1][colSums(is.na(npx[, -1])) == 0]   # proteins without any missing value
+length(pca_eiwitten)# expected 1303
+mat <- as.matrix(npx[, pca_eiwitten])                         # table -> numeric matrix (samples x proteins)
+pca <- prcomp(mat, center = TRUE, scale. = TRUE)              # PCA; each protein centred and scaled (z-scores)
+var_expl <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)      # % variance explained per PC
+var_expl[1:5]
+pca_df <- data.frame(PC1      = pca$x[, 1],              # score of each sample on PC1
+                     PC2      = pca$x[, 2],              # score of each sample on PC2
+                     batch    = meta$olink_batch_id,     # batch per sample
+                     age      = meta$subject.ageGroup)   # age group per sample
+
+ggplot(pca_df, aes(PC1, PC2, color = batch)) +
+  geom_point(size = 1.5) +
+  theme_classic() +
+  labs(x = paste0("PC1 (", var_expl[1], "%)"),
+       y = paste0("PC2 (", var_expl[2], "%)"),
+       color = "Olink batch")
+ggplot(pca_df, aes(PC1, PC2, color = age)) +
+  geom_point(size = 1.5) +
+  theme_classic() +
+  labs(x = paste0("PC1 (", var_expl[1], "%)"),
+       y = paste0("PC2 (", var_expl[2], "%)"),
+       color = "Age group")
+table(meta$olink_batch_id, meta$subject.ageGroup)   # number of samples per batch and age group
+
+library(limma)
+
+design <- model.matrix(~ subject.ageGroup + subject.biologicalSex + cmv_status, data = meta)  # biological effects to preserve
+mat_corr <- removeBatchEffect(t(mat), batch = meta$olink_batch_id, design = design)         # remove batch effect, keep biology
+mat_corr <- t(mat_corr)                                                                     # back to samples x proteins
+dim(mat_corr)                                                                               # expected 867 x 1303
+
+pca_corr <- prcomp(mat_corr, center = TRUE, scale. = TRUE)                  # PCA on batch-corrected data
+var_corr <- round(100 * pca_corr$sdev^2 / sum(pca_corr$sdev^2), 1)          # % variance per PC
+
+pca_corr_df <- data.frame(PC1   = pca_corr$x[, 1],
+                          PC2   = pca_corr$x[, 2],
+                          batch = meta$olink_batch_id,
+                          age   = meta$subject.ageGroup)
+
+ggplot(pca_corr_df, aes(PC1, PC2, color = batch)) +
+  geom_point(size = 1.5) +
+  theme_classic() +
+  labs(x = paste0("PC1 (", var_corr[1], "%)"),
+       y = paste0("PC2 (", var_corr[2], "%)"),
+       color = "Olink batch")
+ggplot(pca_corr_df, aes(PC1, PC2, color = age)) +
+  geom_point(size = 1.5) +
+  theme_classic() +
+  labs(x = paste0("PC1 (", var_corr[1], "%)"),
+       y = paste0("PC2 (", var_corr[2], "%)"),
+       color = "Age group")
+```
+
+# 8. Analysis set (baseline samples)
+Most participants contributed multiple samples over time, which are not independent. For cross-sectional analyses, one sample per participant was therefore retained: the sample from the first visit (days since first visit = 0), which precedes any study interventions. This analysis set contains 96 samples from 96 participants. Batches Q-02017 and Q-04064 contain no baseline samples. Age groups remain unevenly distributed across batches (batch 20201752: 32 young versus 10 older adults), confirming the need to include batch as a covariate. The full dataset (867 samples) is retained for analyses of change over time.In the analysis set, six assays (MPO, SERPINB1, CD177, GRN, MMP9, APP) had 10–33% missing values, confined to plates of batch 20201752; they were removed from the analysis set because missingness was concentrated in young adults (e.g. MPO: 24 of 49 young versus 8 of 47 older adults missing), leaving 1316 complete proteins.
+```{r}
+baseline <- meta$sample.daysSinceFirstVisit == 0   # TRUE for the first sample of each person
+sum(baseline)                                      # number of baseline samples: expected 96
+n_distinct(meta$subject_guid[baseline])            # number of different persons: expected 96
+meta_base <- meta[baseline, ] %>% droplevels()   # metadata of the 96 baseline samples; remove empty factor levels
+npx_base  <- npx[baseline, ]                     # NPX values of the same 96 samples (same row order)
+na_base <- colSums(is.na(npx_base[, -1]))          # number of missing values per protein in the baseline set
+na_base[na_base > 0]                               # which proteins still have missing values
+npx_base <- npx_base %>% select(-all_of(names(na_base)[na_base > 0]))   # remove them from the baseline set
+ncol(npx_base) - 1                                 # expected 1316
+table(meta_base$olink_batch_id, meta_base$subject.ageGroup)   # batch x age group in the analysis set
+```
+
+# 9. Save cleaned data
+The cleaned data were saved as a single R object (data/olink_clean.rds) containing four tables: the metadata and NPX values for all 867 samples (1322 proteins), and for the 96 baseline samples (1316 proteins without missing values). Factor levels and data types are preserved, so parts 2–4 can start directly from this file.
+```{r}
+olink_clean <- list(meta      = meta,        # metadata, all 867 samples
+                    npx       = npx,         # NPX values, all 867 samples, 1322 proteins
+                    meta_base = meta_base,   # metadata, 96 baseline samples
+                    npx_base  = npx_base)    # NPX values, 96 baseline samples, 1316 proteins (no missing values)
+
+saveRDS(olink_clean, "data/olink_clean.rds") # save as one R object
+```
+
